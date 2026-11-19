@@ -67,7 +67,7 @@ class Box:
     leading_collapsible_space = False
     trailing_collapsible_space = False
 
-    # Default, may be overriden on instances.
+    # Default, may be overridden on instances.
     is_table_wrapper = False
     is_flex_item = False
     is_grid_item = False
@@ -765,7 +765,7 @@ class TableRowGroupBox(ParentBox):
     tabular_container = True
     proper_parents = (TableBox, InlineTableBox)
 
-    # Default values. May be overriden on instances.
+    # Default values. May be overridden on instances.
     is_header = False
     is_footer = False
 

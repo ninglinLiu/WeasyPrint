@@ -585,7 +585,7 @@ defining properties dealing "with the decoration of the border area and with
 the background of the content, padding and border areas".
 
 The `border part`_ of this module is supported, as it is already included in
-the the CSS 2.1 specification.
+the CSS 2.1 specification.
 
 WeasyPrint supports the `background part`_ of this module (allowing multiple
 background layers per box), including the ``background``, ``background-color``,
@@ -631,7 +631,7 @@ the same subject.
 The ``linear-gradient()``, ``radial-gradient()`` and
 ``repeating-radial-gradient()`` properties are supported as background images.
 
-The the ``url()`` notation is supported, but the ``image()`` notation is
+The ``url()`` notation is supported, but the ``image()`` notation is
 **not** supported for background images.
 
 The ``object-fit`` and ``object-position`` properties are supported.
