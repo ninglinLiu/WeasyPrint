@@ -67,7 +67,7 @@ class Box:
     leading_collapsible_space = False
     trailing_collapsible_space = False
 
-    # Default, may be overriden on instances.
+    # Default, may be overridden on instances.
     is_table_wrapper = False
     is_flex_item = False
     is_grid_item = False

@@ -585,7 +585,7 @@ defining properties dealing "with the decoration of the border area and with
 the background of the content, padding and border areas".
 
 The `border part`_ of this module is supported, as it is already included in
-the the CSS 2.1 specification.
+the CSS 2.1 specification.
 
 WeasyPrint supports the `background part`_ of this module (allowing multiple
 background layers per box), including the ``background``, ``background-color``,
