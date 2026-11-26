@@ -991,3 +991,282 @@ def test_debug_variant():
         pdf_variant='debug', uncompressed_pdf=True)
     assert b'/T (lipsum)' in pdf
     assert b'/Dest (lipsum)' in pdf
+
+
+def _pdf_skip_space(data, index):
+    while index < len(data) and data[index] in ' \t\r\n\f':
+        index += 1
+    return index
+
+
+def _pdf_parse_value(data, index):
+    """Parse one uncompressed PDF value written by pydyf."""
+    index = _pdf_skip_space(data, index)
+    if data.startswith('<<', index):
+        index += 2
+        result = {}
+        while True:
+            index = _pdf_skip_space(data, index)
+            if data.startswith('>>', index):
+                return result, index + 2
+            key, index = _pdf_parse_value(data, index)
+            value, index = _pdf_parse_value(data, index)
+            result[key] = value
+    if data.startswith('[', index):
+        index += 1
+        result = []
+        while True:
+            index = _pdf_skip_space(data, index)
+            if data.startswith(']', index):
+                return result, index + 1
+            value, index = _pdf_parse_value(data, index)
+            result.append(value)
+    if data.startswith('(', index):
+        index += 1
+        chars = []
+        depth = 1
+        while depth:
+            char = data[index]
+            if char == '\\':
+                chars.append(data[index + 1])
+                index += 2
+                continue
+            index += 1
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            chars.append(char)
+        return ''.join(chars), index
+    if data.startswith('<', index):
+        end = data.index('>', index)
+        return data[index:end + 1], end + 1
+    if data.startswith('/', index):
+        index += 1
+        end = index
+        while end < len(data) and data[end] not in ' \t\r\n\f()<>[]{}/%':
+            end += 1
+        return f'/{data[index:end]}', end
+    if data.startswith(('true', 'false', 'null'), index):
+        for keyword, value in (('true', True), ('false', False), ('null', None)):
+            if data.startswith(keyword, index):
+                return value, index + len(keyword)
+    start = index
+    if data[index] in '+-':
+        index += 1
+    while index < len(data) and (data[index].isdigit() or data[index] == '.'):
+        index += 1
+    token = data[start:index]
+    if token.lstrip('+-').isdigit():
+        cursor = _pdf_skip_space(data, index)
+        generation_end = cursor
+        while generation_end < len(data) and data[generation_end].isdigit():
+            generation_end += 1
+        if generation_end > cursor:
+            after_generation = _pdf_skip_space(data, generation_end)
+            if data.startswith('R', after_generation):
+                return ('ref', int(token)), after_generation + 1
+    if '.' in token:
+        return float(token), index
+    return int(token), index
+
+
+def _pdf_objects(pdf):
+    """Return ``{object_number: value}`` for an uncompressed PDF."""
+    data = pdf.decode('latin1')
+    objects = {}
+    cursor = 0
+    while True:
+        match = re.search(r'(?m)^(\d+) 0 obj\n', data[cursor:])
+        if match is None:
+            break
+        number = int(match.group(1))
+        start = cursor + match.end()
+        value, end = _pdf_parse_value(data, start)
+        objects[number] = value
+        stream = re.match(r'\nstream\n', data[end:])
+        if stream and isinstance(value, dict) and isinstance(value.get('/Length'), int):
+            cursor = end + stream.end() + value['/Length']
+            endobj = data.find('endobj', cursor)
+            cursor = len(data) if endobj < 0 else endobj + len('endobj')
+        else:
+            cursor = end
+    return objects
+
+
+def _pdf_kids(value):
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _assert_link_annotations_are_tagged(pdf, link_count, *, allow_figure=False):
+    """Every link annotation is referenced from a Link structure element.
+
+    ISO 14289-1 clause 7.18.5. Child text is a direct marked-content kid of
+    that Link, not of a nested Span or NonStruct.
+
+    """
+    objects = _pdf_objects(pdf)
+    annotations = [
+        (number, obj) for number, obj in objects.items()
+        if isinstance(obj, dict) and obj.get('/Subtype') == '/Link']
+    assert len(annotations) == link_count
+
+    root = next(
+        obj for obj in objects.values()
+        if isinstance(obj, dict) and obj.get('/Type') == '/StructTreeRoot')
+    parent_tree = objects[root['/ParentTree'][1]]
+    number_tree = {}
+    pairs = iter(parent_tree['/Nums'])
+    for key, value in zip(pairs, pairs, strict=True):
+        number_tree[key] = value
+
+    owners = {}
+    for number, annotation in annotations:
+        assert '/StructParent' in annotation
+        owner = number_tree[annotation['/StructParent']]
+        assert owner[0] == 'ref'
+        owner_object = objects[owner[1]]
+        assert owner_object['/S'] == '/Link', owner_object.get('/S')
+        owners[number] = owner[1]
+
+    referenced = []
+    for number, obj in objects.items():
+        if not (isinstance(obj, dict) and obj.get('/Type') == '/OBJR'):
+            continue
+        target = obj.get('/Obj')
+        if not (
+            isinstance(target, tuple) and
+            objects[target[1]].get('/Subtype') == '/Link'
+        ):
+            continue
+        referenced.append(target[1])
+        parents = []
+        for elem_number, elem in objects.items():
+            if not (isinstance(elem, dict) and elem.get('/Type') == '/StructElem'):
+                continue
+            if ('ref', number) in _pdf_kids(elem.get('/K', [])):
+                parents.append(elem_number)
+        assert parents == [owners[target[1]]]
+
+    assert sorted(referenced) == sorted(number for number, _ in annotations)
+
+    for number, obj in objects.items():
+        if not (
+            isinstance(obj, dict) and obj.get('/Type') == '/StructElem' and
+            obj.get('/S') == '/Link'
+        ):
+            continue
+        kids = _pdf_kids(obj['/K'])
+        saw_text = False
+        saw_annotation = False
+        saw_figure = False
+        for kid in kids:
+            if isinstance(kid, int):
+                page = objects[obj['/Pg'][1]]
+                assert number_tree[page['/StructParents']][kid] == ('ref', number)
+                saw_text = True
+                continue
+            child = objects[kid[1]]
+            if child.get('/Type') == '/OBJR':
+                saw_annotation = True
+                continue
+            assert child.get('/S') not in ('/Span', '/NonStruct')
+            assert child.get('/S') == '/Figure'
+            assert allow_figure
+            saw_figure = True
+            assert '/Alt' in child
+            figure_kids = _pdf_kids(child.get('/K', []))
+            assert not any(
+                isinstance(item, tuple) and objects[item[1]].get('/Type') == '/OBJR'
+                for item in figure_kids)
+        assert saw_annotation
+        if saw_figure:
+            assert allow_figure
+        else:
+            assert saw_text
+
+
+@pytest.mark.parametrize(('html', 'link_count', 'allow_figure'), [
+    (
+        '<p>A plain link: <a href="#target">plain</a>.</p>'
+        '<h2 id="target">Target</h2>',
+        1, False,
+    ),
+    (
+        '<p>Text in a child element: <a href="#target"><span>child span</span></a>.</p>'
+        '<h2 id="target">Target</h2>',
+        2, False,
+    ),
+    (
+        '<p>Mixed <a href="#target">before <span>child</span> after</a>.</p>'
+        '<h2 id="target">Target</h2>',
+        2, False,
+    ),
+    (
+        '<p>Nested <a href="#target"><b><span>bold span</span></b>'
+        ' and <em>em</em></a>.</p>'
+        '<h2 id="target">Target</h2>',
+        4, False,
+    ),
+    (
+        '<p>See <a href="https://example.com/data.csv"><code>a-long-file-name.csv</code></a>'
+        ' for the data.</p>',
+        2, False,
+    ),
+    (
+        '<style>'
+        '  @page { size: 220px 120px; margin: 6px }'
+        '  body { font: 12px weasyprint; margin: 0 }'
+        '</style>'
+        '<p>See <a href="https://example.com/data.csv"><code>a-long-file-name.csv</code></a>'
+        ' for the data.</p>',
+        4, False,
+    ),
+    (
+        '<style>'
+        '  @page { @note-area { content: element(note, all-once) } }'
+        '  .note { position: note(note) }'
+        '</style>'
+        '<p>A CSS Notes note<span class="note">The note body.</span>'
+        ' in a paragraph.</p>',
+        2, False,
+    ),
+    (
+        '<p><a href="https://example.com"><img src="pattern.png" alt="dot"></a></p>',
+        2, True,
+    ),
+])
+@assert_no_logs
+def test_pdfua_link_tagging(html, link_count, allow_figure):
+    # Regression test for #2942.
+    pdf = FakeHTML(string=f'<html lang="en"><body>{html}', base_url=BASE_URL).write_pdf(
+        pdf_variant='pdf/ua-1')
+    _assert_link_annotations_are_tagged(pdf, link_count, allow_figure=allow_figure)
+
+
+@assert_no_logs
+def test_pdfua_link_tagging_combined():
+    # Every annotation in one document is referenced from a Link element.
+    pdf = FakeHTML(string='''
+      <html lang="en">
+      <style>
+        @page { @note-area { content: element(note, all-once) } }
+        .note { position: note(note) }
+      </style>
+      <body>
+        <p>A plain link: <a href="#target">plain</a>.</p>
+        <p>Text in a child element: <a href="#target"><span>child span</span></a>.</p>
+        <p>Nested <a href="#target"><b><span>bold span</span></b>
+           and <em>em</em></a>.</p>
+        <p>See <a href="https://example.com/data.csv"><code>a-long-file-name.csv</code></a>
+           for the data.</p>
+        <p>A CSS Notes note<span class="note">The note body.</span> in a paragraph.</p>
+        <p><a href="https://example.com"><img src="pattern.png" alt="dot"></a></p>
+        <h2 id="target">Target</h2>
+    ''', base_url=BASE_URL).write_pdf(pdf_variant='pdf/ua-1')
+    # 1 plain + 2 span + 4 nested + 2 code + 2 notes + 2 image.
+    _assert_link_annotations_are_tagged(pdf, 13, allow_figure=True)

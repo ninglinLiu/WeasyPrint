@@ -85,6 +85,9 @@ def _get_pdf_tag(tag):
         return 'NonStruct'
     elif tag == 'div':
         return 'Div'
+    elif tag.endswith(('::note-call', '::note-callback')):
+        # CSS Notes call and callback pseudo-elements create link annotations.
+        return 'Link'
     elif tag.split(':')[0] == 'a':
         # Links and link pseudo elements create link annotations.
         return 'Link'
@@ -123,7 +126,47 @@ def _get_pdf_tag(tag):
         return 'NonStruct'
 
 
-def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
+def _attach_link_annotation(box, element, pdf, page_number, annotations):
+    """Reference ``box``'s link annotation from structure element ``element``."""
+    annotation = box.link_annotation
+    object_reference = pydyf.Dictionary({
+        'Type': '/OBJR',
+        'Obj': annotation.reference,
+        'Pg': pdf.page_references[page_number],
+    })
+    pdf.add_object(object_reference)
+    annotations.append((element.reference, annotation))
+    element['K'].append(object_reference.reference)
+
+
+def _flatten_into_link(box, link_element, pdf, page_number, nums, annotations, tags):
+    """Attach an inline box's text and link annotation directly to a Link.
+
+    Phrasing boxes such as ``span`` and ``code`` are not structure elements of
+    their own. Link annotations are emitted for those boxes too, and leaving
+    them nested makes ParentTree point the annotation at a Span or NonStruct
+    instead of the Link (ISO 14289-1, clause 7.18.5).
+
+    """
+    if box.link_annotation:
+        _attach_link_annotation(box, link_element, pdf, page_number, annotations)
+    for child in box.children:
+        children = child.children if isinstance(child, boxes.LineBox) else [child]
+        for child in children:
+            if isinstance(child, boxes.TextBox):
+                kid = tags.pop(child)
+                assert kid['mcid'] not in nums
+                link_element['K'].append(kid['mcid'])
+                nums[kid['mcid']] = link_element.reference
+            else:
+                for element in _build_box_tree(
+                    child, link_element, pdf, page_number, nums, annotations, tags,
+                    link_element):
+                    link_element['K'].append(element.reference)
+
+
+def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags,
+                    link_element=None):
     """Recursively build tag tree for given box and yield children."""
 
     # Special case for absolute elements.
@@ -139,7 +182,8 @@ def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
         if isinstance(box, boxes.ParentBox) and not isinstance(box, boxes.LineBox):
             for child in box.children:
                 yield from _build_box_tree(
-                    child, parent, pdf, page_number, nums, annotations, tags)
+                    child, parent, pdf, page_number, nums, annotations, tags,
+                    link_element)
             return
     elif isinstance(box, boxes.MarginBox):
         # Build tree for margin boxes but don’t link it to main tree. It ensures that
@@ -147,7 +191,8 @@ def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
         # included in tree as Artifact, but that’s only allowed in PDF 2.0.
         for child in box.children:
             tuple(_build_box_tree(
-                child, parent, pdf, page_number, nums, annotations, tags))
+                child, parent, pdf, page_number, nums, annotations, tags,
+                link_element))
         return
     elif tag in ('TD', 'TH'):
         # Ignore anonymous blocks created for table cells.
@@ -179,11 +224,23 @@ def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
             })
             pdf.add_object(parent)
             children = _build_box_tree(
-                box, parent, pdf, page_number, nums, annotations, tags)
+                box, parent, pdf, page_number, nums, annotations, tags, link_element)
             for child in children:
                 parent['K'].append(child.reference)
             yield parent
             return
+
+    # Inline phrasing inside a link (span, code, emphasis, …) is not its own
+    # structure element. Figures and nested links stay real elements. A
+    # figure’s annotation is attached to the enclosing Link; a nested link
+    # keeps its own.
+    if (link_element is not None and parent is link_element and
+            tag in ('Span', 'NonStruct') and
+            isinstance(box, boxes.InlineLevelBox) and
+            not isinstance(box, boxes.ReplacedBox)):
+        _flatten_into_link(
+            box, link_element, pdf, page_number, nums, annotations, tags)
+        return
 
     # Create box element.
     element = pydyf.Dictionary({
@@ -235,17 +292,13 @@ def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
         # TODO: don’t use the box to store this.
         box.mark = element
 
-    # Include link annotations.
+    # Link annotations belong to the nearest Link element. Child boxes of an
+    # <a>, and replaced boxes such as images, get their own annotations.
+    active_link = element if tag == 'Link' else link_element
     if box.link_annotation:
-        annotation = box.link_annotation
-        object_reference = pydyf.Dictionary({
-            'Type': '/OBJR',
-            'Obj': annotation.reference,
-            'Pg': pdf.page_references[page_number],
-        })
-        pdf.add_object(object_reference)
-        annotations.append((element.reference, annotation))
-        element['K'].append(object_reference.reference)
+        _attach_link_annotation(
+            box, active_link if active_link is not None else element,
+            pdf, page_number, annotations)
 
     # Include widget annotations.
     if box.widget_annotation:
@@ -303,7 +356,8 @@ def _build_box_tree(box, parent, pdf, page_number, nums, annotations, tags):
                 # lists.
                 child_index = len(child_parent['K'])
                 child_elements = _build_box_tree(
-                    child, child_parent, pdf, page_number, nums, annotations, tags)
+                    child, child_parent, pdf, page_number, nums, annotations, tags,
+                    active_link)
                 child_parent['K'][child_index:child_index] = [
                     element.reference for element in child_elements]
 
